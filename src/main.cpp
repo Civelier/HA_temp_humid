@@ -5,11 +5,38 @@
 #include <DHT.h>
 #include <DHT_U.h>
 #include <pins_arduino.h>
+#include <ArduinoJson.h>
+#include <SD.h>
+#include <string.h>
 
-#define DHT11_PIN 2
-#define BROKER_ADDRESS IPAddress(192,168,1,162)
-#define REFRESH_MS 1000
+#define CONFIG_PATH "config.json"
 
+#ifdef HAS_SD_CARD
+    DynamicJsonDocument config(1024);
+    #define BROKER_ADDRESS config["broker_address"]
+    #undef WIFI_SSID
+    #define WIFI_SSID config["wifi_ssid"]
+    #undef WIFI_PASSWORD
+    #define WIFI_PASSWORD config["wifi_password"]
+    #undef HA_USERNAME
+    #define HA_USERNAME config["ha_username"]
+    #undef HA_PASSWORD
+    #define HA_PASSWORD config["ha_password"]
+    #define DHT_PIN config["dht_pin"]
+    #define FILE_VERSION config["version"]
+
+#else
+    #define BROKER_ADDRESS "192.168.1.163"
+    #define DHT_PIN 2
+#endif
+
+#if SENSOR_TYPE == 0
+    #define REFRESH_MS 1000
+#endif
+
+#if SENSOR_TYPE == 1
+    #define REFRESH_MS 2000
+#endif
 
 class EmptyStream : public Stream
 {
@@ -21,11 +48,13 @@ public:
     int peek() override { return 0; }
     size_t write(uint8_t) { return 0; }
 
+    operator bool() { return false; }
+
 };
 
 EmptyStream emptyStream = EmptyStream();
 
-#define DEBUG_STREAM emptyStream
+#define DEBUG_STREAM Serial
 
 WiFiClient client;
 HADevice device;
@@ -34,7 +63,13 @@ HAMqtt mqtt(client, device);
 HASensorNumber temp(TEMP_NAME, HASensorNumber::PrecisionP1);
 HASensorNumber humid(HUMID_NAME, HASensorNumber::PrecisionP1);
 
-DHT_Unified dht(DHT11_PIN, DHT11);
+#if SENSOR_TYPE == 0
+    DHT_Unified dht(DHT_PIN, DHT11);
+#endif
+
+#if SENSOR_TYPE == 1
+    DHT_Unified dht(DHT_PIN, DHT22);
+#endif
 
 uint32_t next_update = 0;
 
@@ -92,10 +127,46 @@ void ensureConnected()
     statusLED.write(AHIGH);
 }
 
+void saveConfig()
+{
+    auto file = SD.open(CONFIG_PATH, FILE_WRITE);
+    serializeJsonPretty(config, file);
+    file.close();
+}
+
+void defaultConfig()
+{
+    BROKER_ADDRESS = "";
+    WIFI_SSID = "";
+    WIFI_PASSWORD = "";
+    HA_USERNAME = "";
+    HA_PASSWORD = "";
+    DHT_PIN = 2;
+    saveConfig();
+}
+
+void readConfig()
+{
+    if (SD.exists(CONFIG_PATH))
+    {
+        auto file = SD.open(CONFIG_PATH, FILE_READ);
+        deserializeJson(config, file);
+        file.close();
+        if (!strcmp(FILE_VERSION, VERSION))
+        {
+        }
+    }
+}
+
 void setup() 
 {
+    #ifdef HAS_SD_CARD
+    SD.begin()
+    #endif
     DEBUG_STREAM.begin(9600);
     DEBUG_STREAM.println("Starting...");
+
+
 
     // Unique ID must be set!
     byte mac[WL_MAC_ADDR_LENGTH];
