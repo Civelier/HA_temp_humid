@@ -6,10 +6,16 @@
 #include <DHT_U.h>
 #include <pins_arduino.h>
 #include <ArduinoJson.h>
+#include <SPI.h>
 #include <SD.h>
 #include <string.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
 #define CONFIG_PATH "config.json"
+#define SD_CS_PIN 3
+#define DHT_PIN 2
+#define LCD_ADDRESS 0x27
 
 #ifdef HAS_SD_CARD
     DynamicJsonDocument config(1024);
@@ -22,12 +28,11 @@
     #define HA_USERNAME config["ha_username"]
     #undef HA_PASSWORD
     #define HA_PASSWORD config["ha_password"]
-    #define DHT_PIN config["dht_pin"]
     #define FILE_VERSION config["version"]
-
+    #undef NAME
+    #define NAME config["name"]
 #else
     #define BROKER_ADDRESS "192.168.1.163"
-    #define DHT_PIN 2
 #endif
 
 #if SENSOR_TYPE == 0
@@ -54,7 +59,7 @@ public:
 
 EmptyStream emptyStream = EmptyStream();
 
-#define DEBUG_STREAM Serial
+auto& DEBUG_STREAM = Serial;
 
 WiFiClient client;
 HADevice device;
@@ -62,6 +67,11 @@ HAMqtt mqtt(client, device);
 
 HASensorNumber temp(TEMP_NAME, HASensorNumber::PrecisionP1);
 HASensorNumber humid(HUMID_NAME, HASensorNumber::PrecisionP1);
+
+#if HAS_SCREEN
+// LiquidCrystal_I2C LCD = LiquidCrystal_I2C();
+#else
+#endif
 
 #if SENSOR_TYPE == 0
     DHT_Unified dht(DHT_PIN, DHT11);
@@ -109,7 +119,7 @@ class FakePWM
     }
 };
 
-FakePWM statusLED(LED_BUILTIN);
+FakePWM statusLED(4);
 
 void ensureConnected()
 {
@@ -117,7 +127,9 @@ void ensureConnected()
     statusLED.write(ALOW);
 
     // connect to wifi
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    const char* wifi_ssid = WIFI_SSID;
+    const char* wifi_password = WIFI_PASSWORD;
+    WiFi.begin(wifi_ssid, wifi_password);
     while (WiFi.status() != WL_CONNECTED) {
         DEBUG_STREAM.print(".");
         delay(500); // waiting for the connection
@@ -125,6 +137,38 @@ void ensureConnected()
     DEBUG_STREAM.println();
     DEBUG_STREAM.println("Connected to the network");
     statusLED.write(AHIGH);
+}
+
+#if HAS_SCREEN
+void displayStatus()
+{
+
+}
+
+void displayError(const char* msg)
+{
+}
+
+#else
+void displayStatus()
+{
+
+}
+
+#endif
+
+
+#if HAS_SD_CARD
+void initSD()
+{
+    DEBUG_STREAM.print("Initializing SD card reader ");
+    while (!SD.begin(SD_CS_PIN))
+    {
+        DEBUG_STREAM.print('.');
+        DEBUG_STREAM.flush();
+        delay(500);
+    }
+    DEBUG_STREAM.println("DONE");
 }
 
 void saveConfig()
@@ -141,7 +185,7 @@ void defaultConfig()
     WIFI_PASSWORD = "";
     HA_USERNAME = "";
     HA_PASSWORD = "";
-    DHT_PIN = 2;
+    FILE_VERSION = VERSION;
     saveConfig();
 }
 
@@ -154,19 +198,46 @@ void readConfig()
         file.close();
         if (!strcmp(FILE_VERSION, VERSION))
         {
+            DEBUG_STREAM.println("Invalid version!");
+            defaultConfig();
         }
+    }
+    else
+    {
+        defaultConfig();
     }
 }
 
+void cat()
+{
+    if (SD.exists(CONFIG_PATH))
+    {
+        auto file = SD.open(CONFIG_PATH, FILE_READ);
+        while (file.available())
+        {
+            DEBUG_STREAM.write(file.read());
+        }
+        file.close();
+    }
+}
+#else
+#define initSD()
+#define saveConfig()
+#define defaultConfig()
+#define readConfig()
+#define cat()
+#endif
+
 void setup() 
 {
-    #ifdef HAS_SD_CARD
-    SD.begin()
-    #endif
     DEBUG_STREAM.begin(9600);
+    for (int i = 0; !DEBUG_STREAM && i < 50; i++) delay(100);
     DEBUG_STREAM.println("Starting...");
 
+    initSD();
+    readConfig();
 
+    cat();
 
     // Unique ID must be set!
     byte mac[WL_MAC_ADDR_LENGTH];
@@ -177,9 +248,11 @@ void setup()
     
     ensureConnected();
 
-    // set device's details (optional)
-    device.setName(NAME);
-    device.setSoftwareVersion(VERSION);
+    // Set device's details (optional)
+    const char* name = NAME;
+    const char* version = FILE_VERSION;
+    device.setName(name);
+    device.setSoftwareVersion(version);
 
     // Set temp details
     // temp.setDeviceClass("temperature");
@@ -193,8 +266,11 @@ void setup()
     humid.setIcon("mdi:water-percent");
     humid.setUnitOfMeasurement("%");
 
+    const char* address = BROKER_ADDRESS;
+    const char* ha_username = HA_USERNAME;
+    const char* ha_password = HA_PASSWORD;
 
-    mqtt.begin(BROKER_ADDRESS, HA_USERNAME, HA_PASSWORD);
+    mqtt.begin(address, ha_username, ha_password);
 
     dht.begin();
     dht.temperature().printSensorDetails();
@@ -233,6 +309,7 @@ void loop()
     }
     next_update = millis() + REFRESH_MS;
     sensors_event_t event;
+    // Get temperature event and print value.
     dht.temperature().getEvent(&event);
     if (isnan(event.temperature)) 
     {
