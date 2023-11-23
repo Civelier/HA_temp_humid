@@ -1,16 +1,22 @@
+// Arduino imports
 #include <Arduino.h>
+#include <Wire.h>
+#include <WiFiNINA.h>
+
+// Third party imports
+#include "Sodaq_wdt.h"
+#include <ArduinoHA.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include <DHT_U.h>
+
+// Local imports
 #include "secrets.h"
 #include "common.h"
 #include "FakePWM.h"
-#include <WiFiNINA.h>
-#include <ArduinoHA.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
 #include "UI.h"
-#include <DHT.h>
-#include <DHT_U.h>
-#include "Sodaq_wdt.h"
 
+// Devices
 FakePWM statusLED = FakePWM(4);
 WiFiClient client = WiFiClient();
 HADevice device = HADevice();
@@ -18,6 +24,14 @@ HAMqtt mqtt = HAMqtt(client, device);
 HASensorNumber temp = HASensorNumber(TEMP_NAME, HASensorNumber::PrecisionP1);
 HASensorNumber humid = HASensorNumber(HUMID_NAME, HASensorNumber::PrecisionP1);
 
+/// @brief Low cost update for idle moments
+void update()
+{
+    sodaq_wdt_reset();
+    statusLED.update();
+}
+
+// A random number used to validate the integrity of the values in InitialConfig
 #define MEMORY_ID 478295
 
 struct InitialConfig
@@ -38,6 +52,9 @@ struct InitialConfig
     }
 };
 
+/**
+ * @brief Pointer allocated with malloc to prevent overwriting the values stored in the SRAM. This value stays untouched when restarted.
+ * */ 
 InitialConfig* config = nullptr;
 
 #if HAS_SCREEN
@@ -146,7 +163,6 @@ void setup()
     DEBUG_STREAM.println(config->id);
     DEBUG_STREAM.println(config->tempInit);
     DEBUG_STREAM.println(config->humidInit);
-
     Wire.begin();
 
     sodaq_wdt_reset();
@@ -207,6 +223,7 @@ void setup()
         {
             temp.setValue(0.0f, true);
             mqttUpdate();
+            update();
             delay(5);
         }
         config->tempInit = true;
@@ -224,6 +241,7 @@ void setup()
         {
             humid.setValue(0.0f, true);
             mqttUpdate();
+            update();
             delay(5);
         }
         config->humidInit = true;
@@ -243,9 +261,8 @@ void setup()
 
 void loop() 
 {
-    sodaq_wdt_reset();
+    update();
     ensureConnected();
-    statusLED.update();
     mqttUpdate();
     delay(5);
 
