@@ -1,129 +1,91 @@
 #include <Arduino.h>
+#include "secrets.h"
+#include "common.h"
+#include "FakePWM.h"
 #include <WiFiNINA.h>
 #include <ArduinoHA.h>
-#include "secrets.h"
-#include <DHT.h>
-#include <DHT_U.h>
-#include <pins_arduino.h>
-#include <ArduinoJson.h>
-#include <SPI.h>
-#include <SD.h>
-#include <string.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include "UI.h"
+#include <DHT.h>
+#include <DHT_U.h>
+#include "Sodaq_wdt.h"
 
-#define CONFIG_PATH "config.json"
-#define SD_CS_PIN 3
-#define DHT_PIN 2
-#define LCD_ADDRESS 0x27
+FakePWM statusLED = FakePWM(4);
+WiFiClient client = WiFiClient();
+HADevice device = HADevice();
+HAMqtt mqtt = HAMqtt(client, device);
+HASensorNumber temp = HASensorNumber(TEMP_NAME, HASensorNumber::PrecisionP1);
+HASensorNumber humid = HASensorNumber(HUMID_NAME, HASensorNumber::PrecisionP1);
 
-#ifdef HAS_SD_CARD
-    DynamicJsonDocument config(1024);
-    #define BROKER_ADDRESS config["broker_address"]
-    #undef WIFI_SSID
-    #define WIFI_SSID config["wifi_ssid"]
-    #undef WIFI_PASSWORD
-    #define WIFI_PASSWORD config["wifi_password"]
-    #undef HA_USERNAME
-    #define HA_USERNAME config["ha_username"]
-    #undef HA_PASSWORD
-    #define HA_PASSWORD config["ha_password"]
-    #define FILE_VERSION config["version"]
-    #undef NAME
-    #define NAME config["name"]
-#else
-    #define BROKER_ADDRESS "192.168.1.163"
-#endif
+#define MEMORY_ID 478295
 
-#if SENSOR_TYPE == 0
-    #define REFRESH_MS 1000
-#endif
-
-#if SENSOR_TYPE == 1
-    #define REFRESH_MS 2000
-#endif
-
-class EmptyStream : public Stream
+struct InitialConfig
 {
-public:
-    EmptyStream() {}
-    bool begin(int) { return true; }
-    int available() override { return 0; }
-    int read() override { return 0; }
-    int peek() override { return 0; }
-    size_t write(uint8_t) { return 0; }
+    bool tempInit;
+    bool humidInit;
+    int id;
+    bool tempInitialized()
+    {
+        if (id == MEMORY_ID) return tempInit;
+        return false;
+    }
 
-    operator bool() { return false; }
-
+    bool humidInitialized()
+    {
+        if (id == MEMORY_ID) return humidInit;
+        return false;
+    }
 };
 
-EmptyStream emptyStream = EmptyStream();
-
-auto& DEBUG_STREAM = Serial;
-
-WiFiClient client;
-HADevice device;
-HAMqtt mqtt(client, device);
-
-HASensorNumber temp(TEMP_NAME, HASensorNumber::PrecisionP1);
-HASensorNumber humid(HUMID_NAME, HASensorNumber::PrecisionP1);
+InitialConfig* config = nullptr;
 
 #if HAS_SCREEN
-// LiquidCrystal_I2C LCD = LiquidCrystal_I2C();
+    LiquidCrystal_I2C LCD = LiquidCrystal_I2C(LCD_ADDRESS, 16, 2);
+    UI ui = UI(LCD);
 #else
+    UI ui = UI();
 #endif
 
 #if SENSOR_TYPE == 0
-    DHT_Unified dht(DHT_PIN, DHT11);
+    DHT_Unified dht = DHT_Unified(DHT_PIN, DHT11);
 #endif
 
 #if SENSOR_TYPE == 1
-    DHT_Unified dht(DHT_PIN, DHT22);
+    DHT_Unified dht = DHT_Unified(DHT_PIN, DHT22);
 #endif
 
+
+typedef const char* c_str_t;
+
 uint32_t next_update = 0;
+uint32_t lastWifiConnection = 0;
+uint32_t lastHaConnection = 0;
+int bootStepNumber = 0;
 
-#define AHIGH 255
-#define ALOW 0
-#define BREATHE_TIME 5000
-#define TEMP_OFFSET (-3.0f)
-
-class FakePWM
-{
-    private:
-    const uint64_t m_cycleus = 10000;
-    pin_size_t m_pin;
-    int m_level = 0;
-    public:
-    FakePWM(pin_size_t pin)
-    {
-        m_pin = pin;
-    }
-
-    void begin()
-    {
-        pinMode(m_pin, OUTPUT);
-    }
-
-    void write(int value)
-    {
-        m_level = value;
-        update();
-    }
-
-    void update()
-    {
-        uint64_t c = micros() % m_cycleus;
-        int v = c * AHIGH / m_cycleus;
-        digitalWrite(m_pin, v < m_level ? LOW : HIGH);
-    }
+c_str_t bootSteps[] = {
+    "Init",
+    "WiFi",
+    "MQTT",
+    "Add temp",
+    "Add humid",
+    "DHT",
 };
-
-FakePWM statusLED(4);
 
 void ensureConnected()
 {
-    if (WiFi.status() == wl_status_t::WL_CONNECTED) return;
+    if (WiFi.status() == wl_status_t::WL_CONNECTED) 
+    {
+        lastWifiConnection = millis();
+        return;
+    }
+    if (millis() - lastWifiConnection > WIFI_TIMEOUT) 
+    {
+        ui.DrawError("WIFI TIMED OUT");
+        sodaq_wdt_safe_delay(3000);
+        exit(1);
+    }
+    ui.SetWifiState(false);
     statusLED.write(ALOW);
 
     // connect to wifi
@@ -132,112 +94,74 @@ void ensureConnected()
     WiFi.begin(wifi_ssid, wifi_password);
     while (WiFi.status() != WL_CONNECTED) {
         DEBUG_STREAM.print(".");
-        delay(500); // waiting for the connection
+        sodaq_wdt_safe_delay(500); // waiting for the connection
     }
-    DEBUG_STREAM.println();
-    DEBUG_STREAM.println("Connected to the network");
+    // DEBUG_STREAM.println();
+    // DEBUG_STREAM.println("Connected to the network");
+    ui.SetWifiState(true);
     statusLED.write(AHIGH);
 }
 
-#if HAS_SCREEN
-void displayStatus()
+void updateProgress()
 {
-
+    sodaq_wdt_reset();
+    ui.DrawProgress(bootSteps[bootStepNumber], bootStepNumber + 1, 6);
+    ui.DrawWidgets();
+    bootStepNumber++;
 }
 
-void displayError(const char* msg)
+void mqttUpdate()
 {
-}
-
-#else
-void displayStatus()
-{
-
-}
-
-#endif
-
-
-#if HAS_SD_CARD
-void initSD()
-{
-    DEBUG_STREAM.print("Initializing SD card reader ");
-    while (!SD.begin(SD_CS_PIN))
+    mqtt.loop();
+    sodaq_wdt_reset();
+    if (mqtt.isConnected())
     {
-        DEBUG_STREAM.print('.');
-        DEBUG_STREAM.flush();
-        delay(500);
-    }
-    DEBUG_STREAM.println("DONE");
-}
-
-void saveConfig()
-{
-    auto file = SD.open(CONFIG_PATH, FILE_WRITE);
-    serializeJsonPretty(config, file);
-    file.close();
-}
-
-void defaultConfig()
-{
-    BROKER_ADDRESS = "";
-    WIFI_SSID = "";
-    WIFI_PASSWORD = "";
-    HA_USERNAME = "";
-    HA_PASSWORD = "";
-    FILE_VERSION = VERSION;
-    saveConfig();
-}
-
-void readConfig()
-{
-    if (SD.exists(CONFIG_PATH))
-    {
-        auto file = SD.open(CONFIG_PATH, FILE_READ);
-        deserializeJson(config, file);
-        file.close();
-        if (!strcmp(FILE_VERSION, VERSION))
-        {
-            DEBUG_STREAM.println("Invalid version!");
-            defaultConfig();
-        }
+        lastHaConnection = millis();
+        ui.SetHaState(true);
+        int v = (int)(abs((float)(millis() % BREATHE_TIME) / ((float)BREATHE_TIME/2.0) - 1.0) * AHIGH);
+        statusLED.write(v);
     }
     else
     {
-        defaultConfig();
-    }
-}
-
-void cat()
-{
-    if (SD.exists(CONFIG_PATH))
-    {
-        auto file = SD.open(CONFIG_PATH, FILE_READ);
-        while (file.available())
+        ui.SetHaState(false);
+        analogWrite(LED_BUILTIN, (millis() % 1000) > 500 ? ALOW : AHIGH);
+        // DEBUG_STREAM.print('.');
+        // DEBUG_STREAM.flush();
+        if (millis() - lastHaConnection > HA_TIMEOUT) 
         {
-            DEBUG_STREAM.write(file.read());
+            ui.DrawError("HA TIMED OUT");
+            sodaq_wdt_safe_delay(3000);
+            exit(1);
         }
-        file.close();
     }
 }
-#else
-#define initSD()
-#define saveConfig()
-#define defaultConfig()
-#define readConfig()
-#define cat()
-#endif
 
-void setup() 
+void setup()
 {
+    config = (InitialConfig*)malloc(sizeof(InitialConfig));
     DEBUG_STREAM.begin(9600);
-    for (int i = 0; !DEBUG_STREAM && i < 50; i++) delay(100);
+    for (int i = 0; !DEBUG_STREAM && i < 50; i++) sodaq_wdt_safe_delay(100);
+    sodaq_wdt_enable(WDT_PERIOD_2X);
+
+    DEBUG_STREAM.println(config->id);
+    DEBUG_STREAM.println(config->tempInit);
+    DEBUG_STREAM.println(config->humidInit);
+
+    Wire.begin();
+
+    sodaq_wdt_reset();
     DEBUG_STREAM.println("Starting...");
+    // Setup LCD
+    LCD.init();
+    DEBUG_STREAM.println("Lcd init...");
+    DEBUG_STREAM.flush();
+    LCD.clear();
+    LCD.backlight();
+    ui.Setup();
+    sodaq_wdt_reset();
 
-    initSD();
-    readConfig();
 
-    cat();
+    updateProgress();
 
     // Unique ID must be set!
     byte mac[WL_MAC_ADDR_LENGTH];
@@ -246,13 +170,14 @@ void setup()
 
     statusLED.begin();
     
+    updateProgress();
+
+    lastWifiConnection = millis();
     ensureConnected();
 
     // Set device's details (optional)
-    const char* name = NAME;
-    const char* version = FILE_VERSION;
-    device.setName(name);
-    device.setSoftwareVersion(version);
+    device.setName(NAME);
+    device.setSoftwareVersion(VERSION);
 
     // Set temp details
     // temp.setDeviceClass("temperature");
@@ -266,12 +191,46 @@ void setup()
     humid.setIcon("mdi:water-percent");
     humid.setUnitOfMeasurement("%");
 
-    const char* address = BROKER_ADDRESS;
-    const char* ha_username = HA_USERNAME;
-    const char* ha_password = HA_PASSWORD;
+    updateProgress();
+    mqtt.begin(BROKER_ADDRESS, HA_USERNAME, HA_PASSWORD);
+    lastHaConnection = millis();
+    while (!mqtt.isConnected()) mqttUpdate();
 
-    mqtt.begin(address, ha_username, ha_password);
+    updateProgress();
+    if (!config->tempInitialized())
+    {
+        config->id = MEMORY_ID;
+        mqtt.addDeviceType(&temp);
 
+        next_update = millis() + 2000;
+        while (millis() < next_update)
+        {
+            temp.setValue(0.0f, true);
+            mqttUpdate();
+            delay(5);
+        }
+        config->tempInit = true;
+        exit(0);
+    }
+
+    updateProgress();
+    if (!config->humidInitialized())
+    {
+        config->id = MEMORY_ID;
+        mqtt.addDeviceType(&humid);
+
+        next_update = millis() + 2000;
+        while (millis() < next_update)
+        {
+            humid.setValue(0.0f, true);
+            mqttUpdate();
+            delay(5);
+        }
+        config->humidInit = true;
+        exit(0);
+    }
+
+    updateProgress();
     dht.begin();
     dht.temperature().printSensorDetails();
     dht.humidity().printSensorDetails();
@@ -279,29 +238,16 @@ void setup()
     device.publishAvailability();
     next_update = millis();
 
-    mqtt.addDeviceType(&temp);
-    mqtt.addDeviceType(&humid);
+    
 }
-
 
 void loop() 
 {
+    sodaq_wdt_reset();
     ensureConnected();
     statusLED.update();
-    mqtt.loop();
-    if (mqtt.isConnected())
-    {
-        int v = (int)(abs((float)(millis() % BREATHE_TIME) / ((float)BREATHE_TIME/2.0) - 1.0) * AHIGH);
-        statusLED.write(v);
-    }
-    else
-    {
-        analogWrite(LED_BUILTIN, (millis() % 1000) > 500 ? ALOW : AHIGH);
-        DEBUG_STREAM.print('.');
-        DEBUG_STREAM.flush();
-        delay(500);
-        return;
-    }
+    mqttUpdate();
+    delay(5);
 
     if (millis() < next_update)
     {
@@ -311,6 +257,8 @@ void loop()
     sensors_event_t event;
     // Get temperature event and print value.
     dht.temperature().getEvent(&event);
+    float tempv = 0;
+    float humidv = 0;
     if (isnan(event.temperature)) 
     {
         DEBUG_STREAM.println(F("Error reading temperature!"));
@@ -322,6 +270,7 @@ void loop()
         DEBUG_STREAM.print(v);
         DEBUG_STREAM.println(F("°C"));
         temp.setValue(v);
+        tempv = v;
     }
     // Get humidity event and print its value.
     dht.humidity().getEvent(&event);
@@ -335,5 +284,7 @@ void loop()
         DEBUG_STREAM.print(event.relative_humidity);
         DEBUG_STREAM.println(F("%"));
         humid.setValue(event.relative_humidity);
+        humidv = event.relative_humidity;
     }
+    ui.DrawValues(tempv, humidv);
 }
