@@ -3,6 +3,7 @@
 #include "secrets.h"
 
 #define DHT_PIN 2
+#define CFG_PIN 3
 #define LCD_ADDRESS 0x27
 
 #if SENSOR_TYPE == 0
@@ -18,7 +19,8 @@
 #define BREATHE_TIME 5000
 #define WIFI_TIMEOUT 60
 #define HA_TIMEOUT 120
-
+#define RSSI_LEVEL(_rssi) map(_rssi, -50,-85, 3, 1);
+#define RSSI_REFRESH 5000
 
 class EmptyStream : public Stream
 {

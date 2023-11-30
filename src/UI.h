@@ -14,7 +14,7 @@ private:
     #if HAS_SCREEN
     LiquidCrystal_I2C* m_lcd;
     #endif
-    bool m_wifiConnected;
+    int m_wifiLevel;
     bool m_haConnected;
 
 public:
@@ -29,7 +29,8 @@ public:
     void DrawWidgets();
     void DrawValues(float temp, float humid);
     void DrawError(const char* msg);
-    void SetWifiState(bool connected);
+    void DrawInfo(const char* msg);
+    void SetWifiState(int level);
     void SetHaState(bool connected);
 private:
     #if HAS_SCREEN
