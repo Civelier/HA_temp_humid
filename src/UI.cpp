@@ -3,7 +3,7 @@
 
 #if HAS_SCREEN
 
-static_assert(sizeof(NAME) <= 14, "NAME has to have less than 14 chars.");
+static_assert(sizeof(NAME) <= MAX_NAME_LENGTH, "NAME has to have less than 14 chars.");
 
 #define NO_WIFI_CHAR 0
 byte noWifi_char[] = {

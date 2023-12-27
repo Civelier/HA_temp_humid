@@ -9,6 +9,7 @@
 #include <LiquidCrystal_I2C.h>
 #include <DHT.h>
 #include <DHT_U.h>
+#include <FlashStorage_SAMD.h>
 
 // Local imports
 #include "secrets.h"
@@ -38,8 +39,6 @@ c_str_t bootSteps[] = {
     "DHT",
     "WiFi",
     "MQTT",
-    "Add temp",
-    "Add humid",
 };
 
 // A random number used to validate the integrity of the values in InitialConfig
@@ -61,12 +60,42 @@ struct InitialConfig
         if (id == MEMORY_ID) return humidInit;
         return false;
     }
+
+    bool isValid()
+    {
+        return id == MEMORY_ID;
+    }
 };
 
-/**
- * @brief Pointer allocated with malloc to prevent overwriting the values stored in the SRAM. This value stays untouched when restarted.
- * */ 
-InitialConfig* config = nullptr;
+struct MainConfig
+{
+    char wifi_ssid[WL_SSID_MAX_LENGTH+1];
+    char wifi_password[WL_WPA_KEY_MAX_LENGTH+1];
+    char ha_username[32];
+    char ha_password[32];
+    char ha_broker[64];
+    char name[MAX_NAME_LENGTH];
+    char temp_name[32];
+    char humid_name[32];
+    float temp_offset;
+    float humid_offset;
+
+    void printTo(Print& p)
+    {
+        p.print("SSID: "); p.println(wifi_ssid);
+        p.print("Password: "); p.println(wifi_password);
+        p.print("Username: "); p.println(ha_username);
+        p.print("Password: "); p.println(ha_password);
+        p.print("Broker: "); p.println(ha_broker);
+        p.print("Name: "); p.println(name);
+        p.print("Temp name: "); p.println(temp_name);
+        p.print("Humid name: "); p.println(humid_name);
+        p.print("Temp offset: "); p.println(temp_offset);
+        p.print("Humid offset: "); p.println(humid_offset);
+    }
+};
+
+MainConfig mainConfig;
 
 #if HAS_SCREEN
     LiquidCrystal_I2C LCD = LiquidCrystal_I2C(LCD_ADDRESS, 16, 2);
@@ -120,7 +149,7 @@ void update()
     else 
     {
         DEBUG_STREAM.print(F("Temperature: "));
-        auto v = event.temperature + TEMP_OFFSET;
+        auto v = event.temperature + mainConfig.temp_offset;
         DEBUG_STREAM.print(v);
         DEBUG_STREAM.println(F("°C"));
         temp.setValue(v);
@@ -135,10 +164,10 @@ void update()
     else 
     {
         DEBUG_STREAM.print(F("Humidity: "));
-        DEBUG_STREAM.print(event.relative_humidity);
+        humidv = event.relative_humidity + mainConfig.humid_offset;
+        DEBUG_STREAM.print(humidv);
         DEBUG_STREAM.println(F("%"));
         humid.setValue(event.relative_humidity);
-        humidv = event.relative_humidity;
     }
     ui.DrawValues(tempv, humidv);
 }
@@ -151,7 +180,8 @@ void safeDelay(uint32_t ms)
 
 bool ensureConnected()
 {
-    if (WiFi.status() == wl_status_t::WL_CONNECTED) 
+    static bool first = true;
+    if (WiFi.status() == wl_status_t::WL_CONNECTED && WiFi.localIP() != IPAddress(0,0,0,0))
     {
         lastWifiConnection = millis();
         if (next_rssiUpdate < millis())
@@ -159,30 +189,34 @@ bool ensureConnected()
             int lvl = RSSI_LEVEL(WiFi.RSSI());
             ui.SetWifiState(lvl);
             next_rssiUpdate = millis() + RSSI_REFRESH;
+            DEBUG_STREAM.print("RSSI: "); DEBUG_STREAM.println(WiFi.RSSI());
         }
         return true;
     }
-    if (millis() - lastWifiConnection > WIFI_TIMEOUT) 
+    if (millis() - lastWifiConnection > (WIFI_TIMEOUT * 1000))
     {
-        ui.DrawError("WIFI TIMED OUT");
+        ui.DrawError(ERR_WIFI_TIMED_OUT);
         safeDelay(3000);
         exit(1);
     }
+    
+    if (!first) WiFi.end();
+    else first = false;
+
     ui.SetWifiState(0);
 
     // connect to wifi
-    const char* wifi_ssid = WIFI_SSID;
-    const char* wifi_password = WIFI_PASSWORD;
-    WiFi.begin(wifi_ssid, wifi_password);
+    WiFi.begin(mainConfig.wifi_ssid, mainConfig.wifi_password);
+    
     DEBUG_STREAM.print(".");
-    safeDelay(500); // waiting for the connection
+    safeDelay(2000); // waiting for the connection
     return false;
 }
 
 void updateProgress()
 {
     sodaq_wdt_reset();
-    ui.DrawProgress(bootSteps[bootStepNumber], bootStepNumber + 1, 6);
+    ui.DrawProgress(bootSteps[bootStepNumber], bootStepNumber + 1, 4);
     ui.DrawWidgets();
     bootStepNumber++;
 }
@@ -199,25 +233,40 @@ void mqttUpdate()
     else
     {
         ui.SetHaState(false);
-        
-        // DEBUG_STREAM.print('.');
-        // DEBUG_STREAM.flush();
-        if (millis() - lastHaConnection > HA_TIMEOUT) 
+        update();
+        if (millis() - lastHaConnection > (HA_TIMEOUT * 1000))
         {
-            ui.DrawError("HA TIMED OUT");
+            ui.DrawError(ERR_HA_TIMED_OUT);
             safeDelay(3000);
             exit(1);
         }
     }
 }
 
+void loadConfig()
+{
+    mainConfig = MainConfig{
+        WIFI_SSID,
+        WIFI_PASSWORD,
+        HA_USERNAME,
+        HA_PASSWORD,
+        BROKER_ADDRESS,
+        NAME,
+        TEMP_NAME,
+        HUMID_NAME,
+        TEMP_OFFSET,
+        HUMID_OFFSET
+    };
+}
+
 void setup()
 {
-    config = (InitialConfig*)malloc(sizeof(InitialConfig));
     sodaq_wdt_enable(WDT_PERIOD_2X);
 
+    // Setup Wire
     Wire.begin();
     sodaq_wdt_reset();
+
     // Setup LCD
     LCD.init();
     LCD.clear();
@@ -226,19 +275,22 @@ void setup()
     updateProgress();
 
     sodaq_wdt_reset();
+
+    // Setup Serial
     DEBUG_STREAM.begin(9600);
     for (int i = 0; !DEBUG_STREAM && i < 50; i++) sodaq_wdt_safe_delay(100);
     DEBUG_STREAM.println("Starting...");
 
+    statusLED.begin();
     
-    
+    loadConfig();
+    mainConfig.printTo(DEBUG_STREAM);
 
     // Unique ID must be set!
     byte mac[WL_MAC_ADDR_LENGTH];
     WiFi.macAddress(mac);
     device.setUniqueId(mac, sizeof(mac));
 
-    statusLED.begin();
     
     updateProgress();
     dht.begin();
@@ -247,92 +299,35 @@ void setup()
     
     updateProgress();
 
+    WiFi.setFeedWatchdogFunc(&update);
+    WiFi.feedWatchdog();
     lastWifiConnection = millis();
-    while (!ensureConnected());
+    while (!ensureConnected()) safeDelay(100);
 
     // Set device's details (optional)
-    device.setName(NAME);
+    device.setName(mainConfig.name);
     device.setSoftwareVersion(VERSION);
 
+    updateProgress();
+    mqtt.begin(mainConfig.ha_broker, mainConfig.ha_username, mainConfig.ha_password);
+
+    // Set temp details
+    // temp.setDeviceClass("temperature");
+    temp.setName(mainConfig.temp_name);
+    temp.setIcon("mdi:thermometer");
+    temp.setUnitOfMeasurement("°C");
     
 
-
-    updateProgress();
-    mqtt.begin(BROKER_ADDRESS, HA_USERNAME, HA_PASSWORD);
-
-    if (!config->tempInitialized())
-    {
-        // Set temp details
-        // temp.setDeviceClass("temperature");
-        temp.setName(TEMP_NAME);
-        temp.setIcon("mdi:thermometer");
-        temp.setUnitOfMeasurement("°C");
-        
-
-        // Set humid details
-        // humid.setDeviceClass("humidity");
-        humid.setName(HUMID_NAME);
-        humid.setIcon("mdi:water-percent");
-        humid.setUnitOfMeasurement("%");
-    }
-    else
-    {
-        // Set humid details
-        // humid.setDeviceClass("humidity");
-        humid.setName(HUMID_NAME);
-        humid.setIcon("mdi:water-percent");
-        humid.setUnitOfMeasurement("%");
-        
-
-        // Set temp details
-        // temp.setDeviceClass("temperature");
-        temp.setName(TEMP_NAME);
-        temp.setIcon("mdi:thermometer");
-        temp.setUnitOfMeasurement("°C");
-    }
+    // Set humid details
+    // humid.setDeviceClass("humidity");
+    humid.setName(mainConfig.humid_name);
+    humid.setIcon("mdi:water-percent");
+    humid.setUnitOfMeasurement("%");
 
     lastHaConnection = millis();
-    while (!mqtt.isConnected()) mqttUpdate();
-
-    updateProgress();
-    if (!config->tempInitialized())
+    while (!mqtt.isConnected()) 
     {
-        config->id = MEMORY_ID;
-        mqtt.addDeviceType(&temp);
-        temp.setAvailability(true);
-
-        next_update = millis() + 5000;
-        while (millis() < next_update)
-        {
-            temp.setValue(0.0f, true);
-            mqttUpdate();
-            delay(5);
-        }
-        config->tempInit = true;
-        config->humidInit = false;
-        ui.DrawInfo("Restarting...");
-        delay(1000);
-        for(;;);
-    }
-
-    updateProgress();
-    if (!config->humidInitialized())
-    {
-        config->id = MEMORY_ID;
-        mqtt.addDeviceType(&humid);
-        humid.setAvailability(true);
-
-        next_update = millis() + 5000;
-        while (millis() < next_update)
-        {
-            humid.setValue(0.0f, true);
-            mqttUpdate();
-            delay(5);
-        }
-        config->humidInit = true;
-        ui.DrawInfo("Restarting...");
-        delay(1000);
-        for(;;);
+        if (ensureConnected()) mqttUpdate();
     }
 
     mqtt.addDeviceType(&humid);
@@ -354,6 +349,4 @@ void loop()
     ensureConnected();
     mqttUpdate();
     update();
-
-    
 }
